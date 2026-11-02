@@ -2,9 +2,10 @@ import time, random, os
 import serial.tools.list_ports
 from PyQt5.QtWidgets import QMainWindow, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, \
     QWidget, QCheckBox, QStatusBar, QLabel, QPlainTextEdit, QTabWidget, QHBoxLayout, QSpacerItem, QSizePolicy, \
-    QLineEdit, QComboBox
+    QLineEdit, QComboBox, QProgressBar
 from PyQt5.QtGui import QPainter, QBrush
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from concurrent.futures import ThreadPoolExecutor
 import serial
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 from radar_calculator import RadarCalculator
@@ -45,8 +46,14 @@ class CircleWidget(QWidget):
 
 # UI class
 class MainWindow(QMainWindow, QWidget):
+    log_message = pyqtSignal(str)
+    command_progress = pyqtSignal(int, int)
+    job_done = pyqtSignal()
+
     def __init__(self):
         super().__init__()
+        self.command_executor = ThreadPoolExecutor(max_workers=1)
+        self.pending_jobs = 0
         self.setWindowTitle("TI mmWave Radar Control Panel")
         self.setWindowIcon(QIcon(icon_path))
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -492,6 +499,7 @@ class MainWindow(QMainWindow, QWidget):
 
         # Create a plain text edit for entering commands
         self.command_textbox = QPlainTextEdit()
+        self.log_message.connect(self.command_textbox.appendPlainText)
         # self.command_textbox.setPlaceholderText("Enter commands here...")
 
         # Create a button to load configuration to the device
@@ -861,6 +869,12 @@ class MainWindow(QMainWindow, QWidget):
         # Status bar
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setMaximumWidth(250)
+        self.busy_bar.hide()
+        self.statusBar.addPermanentWidget(self.busy_bar)
+        self.command_progress.connect(self.on_command_progress)
+        self.job_done.connect(self.on_job_done)
         self.statusBar.addPermanentWidget(self.data_circle)
         self.statusBar.addPermanentWidget(self.data_status_label)
         self.statusBar.addPermanentWidget(self.command_circle)
@@ -1528,10 +1542,12 @@ class MainWindow(QMainWindow, QWidget):
                 data_port = len(ports) - 1
                 if ("Silicon Labs Dual CP2105 USB to UART Bridge: Enhanced COM Port" in port.description
                     or "Application" in port.description
+                    or "XR21V1412 USB UART Ch A" in port.description
                     or "CP2105 Dual USB to UART Bridge Controller - Enhanced Com Port" in port.description):
                     command_checkbox.setChecked(True)
                 elif ("Silicon Labs Dual CP2105 USB to UART Bridge: Standard COM Port" in port.description
                     or "Auxiliary" in port.description
+                    or "XR21V1412 USB UART Ch B" in port.description
                     or "CP2105 Dual USB to UART Bridge Controller - Standard Com Port" in port.description):
                     data_checkbox.setChecked(True)
 
@@ -1547,7 +1563,15 @@ class MainWindow(QMainWindow, QWidget):
     def connect_checked_ports(self):
         # Disconnect from the current ports
         self.disconnect_ports()
-        time.sleep(1)
+
+        # Give the ports a second to be released without freezing the UI
+        self.connect_button.setEnabled(False)
+        self.start_job("Connecting...", 0)
+        QTimer.singleShot(1000, self.connect_checked_ports_after_release)
+
+    def connect_checked_ports_after_release(self):
+        self.connect_button.setEnabled(True)
+        self.on_job_done()
 
         # Get the number of rows in the table
         num_rows = self.table.rowCount()
@@ -1663,6 +1687,7 @@ class MainWindow(QMainWindow, QWidget):
         self.command_textbox.appendPlainText("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
         # Loop through the command_table to read commands
+        commands = []
         for row in range(self.command_table.rowCount()):
             # Extract command from the table (e.g., first column, second column)
             command_item = self.command_table.item(row, 0)  # First column: command
@@ -1672,10 +1697,44 @@ class MainWindow(QMainWindow, QWidget):
             if command_item is not None:
                 first_part_command = command_item.text().strip()  # Remove any spaces or newlines
                 parameters = parameter_item.text().strip()
-                full_command = f"{first_part_command} {parameters}"  # Combine command and parameters
-                # logging.info(full_command)
-                command_bytes = full_command.encode('latin1') + b'\n'
-                self.command_port.write(command_bytes)
+                commands.append(f"{first_part_command} {parameters}")  # Combine command and parameters
+            else:
+                print(f"Row {row}: Command is empty or invalid.")
+                self.command_textbox.appendPlainText(f"Row {row}: Command is empty or invalid.")
+
+        self.submit_commands(commands, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+
+    def start_job(self, label, total):
+        """Shows the busy bar; total 0 means an indeterminate (moving) bar."""
+        self.pending_jobs += 1
+        self.send_button.setEnabled(False)
+        self.busy_bar.setRange(0, total)
+        self.busy_bar.setValue(0)
+        self.busy_bar.setFormat(f"{label} %v/%m")
+        self.busy_bar.setTextVisible(total > 0)
+        self.busy_bar.show()
+
+    def on_command_progress(self, done, total):
+        self.busy_bar.setRange(0, total)
+        self.busy_bar.setValue(done)
+
+    def on_job_done(self):
+        self.pending_jobs -= 1
+        if self.pending_jobs == 0:
+            self.busy_bar.hide()
+            self.send_button.setEnabled(True)
+
+    def submit_commands(self, commands, done_message=None):
+        self.start_job("Sending", len(commands))
+        self.command_executor.submit(self.write_commands, commands, done_message)
+
+    def write_commands(self, commands, done_message=None):
+        """Runs on the command worker thread so the UI never waits on the serial port."""
+        command = None
+        try:
+            for index, command in enumerate(commands):
+                self.command_progress.emit(index, len(commands))
+                self.command_port.write(command.encode('latin1') + b'\n')
                 time.sleep(0.1)
 
                 # Read the response
@@ -1684,26 +1743,16 @@ class MainWindow(QMainWindow, QWidget):
                     response_bytes = self.command_port.read(byteCount)
                     response_str = response_bytes.decode('latin1').strip().replace("\n", "\n\t")
                     print(response_str)
-                    self.command_textbox.appendPlainText(f"Response : {response_str}")
-            else:
-                print(f"Row {row}: Command is empty or invalid.")
-                self.command_textbox.appendPlainText(f"Row {row}: Command is empty or invalid.")
-
-        self.command_textbox.appendPlainText("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        # self.send_button.setEnabled(False)
-        time.sleep(0.2)
+                    self.log_message.emit(f"Response : {response_str}")
+            if done_message:
+                self.log_message.emit(done_message)
+        except Exception as e:
+            self.log_message.emit(f"Error sending '{command}': {e}")
+        finally:
+            self.job_done.emit()
 
     def stop_device(self):
-        self.command_port.write(b'sensorStop \n')
-        time.sleep(0.1)
-
-        # Read the response
-        byteCount = self.command_port.in_waiting
-        if byteCount > 0:
-            response_bytes = self.command_port.read(byteCount)
-            response_str = response_bytes.decode('latin1').strip().replace("\n", "\n\t")
-            print(response_str)
-            self.command_textbox.appendPlainText(f"Response : {response_str}")
+        self.submit_commands(["sensorStop "])
 
     def on_plot_selection_toggled(self, state, row, param):
         """
@@ -2375,20 +2424,8 @@ class MainWindow(QMainWindow, QWidget):
             self.command_textbox.appendPlainText("Error: Command port is not connected")
             return
 
-        # Encode the command to bytes and send it via the command port
-        command_bytes = command.encode('latin1') + b'\n'
-
-        # Send the command over the command port
-        self.command_port.write(command_bytes)
-        time.sleep(0.1)  # Wait for a short time to allow the command to be processed
-
-        # Read the response from the device
-        byteCount = self.command_port.in_waiting
-        if byteCount > 0:
-            response_bytes = self.command_port.read(byteCount)
-            response_str = response_bytes.decode('latin1').strip().replace("\n", "\n\t")
-            print(response_str)
-            self.command_textbox.appendPlainText(f"Response: {response_str}")
+        # Send the command over the command port on the worker thread
+        self.submit_commands([command])
 
         # Set the QLineEdits in the corresponding cells
 

@@ -5,7 +5,8 @@ import logging
 from payload import RadarDataParser
 from plots import RadarVisualizer
 import numpy as np
-from scipy.interpolate import griddata
+from scipy.interpolate import CloughTocher2DInterpolator
+from scipy.spatial import Delaunay
 from scipy.ndimage import zoom
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,6 +35,12 @@ class RadarApplication:
 
         self.pos = None
         self.doppler = None
+
+        # Filled by the processing thread, drawn by the GUI thread (Qt widgets are GUI-thread only)
+        self.pending_tables = {}
+        self.is_new_frame = False
+        self.azimuth_triangulation_key = None
+        self.azimuth_triangulation = None
 
     def _setup_visualizations(self):
         """Setup plots for visualizing radar data."""
@@ -202,16 +209,16 @@ class RadarApplication:
         """Handle parsed radar data."""
         try:
             if parsed_header:
-                window.update_specified_table('header_table', parsed_header)
+                self.pending_tables['header_table'] = parsed_header
 
             for tlv in tlv_data:
                 tlv_info = tlv['data']
                 tlv_type = tlv['type']
 
                 if tlv_type == 6:
-                    window.update_specified_table('statistics_table', tlv_info)
+                    self.pending_tables['statistics_table'] = tlv_info
                 elif tlv_type == 9:
-                    window.update_specified_table('temperature_table', tlv_info)
+                    self.pending_tables['temperature_table'] = tlv_info
                 elif tlv_type == 2:
                     self.range_profile = tlv_info
                 elif tlv_type == 3:
@@ -222,15 +229,24 @@ class RadarApplication:
                     self.range_doppler_heatmap = tlv_info
                 elif tlv_type == 1:
                     self.detected_points = tlv_info
-                    window.update_specified_table('detected_points_table', tlv_info)
+                    self.pending_tables['detected_points_table'] = tlv_info
                 elif tlv_type == 7:
                     self.side_info_for_detected_points = tlv_info
-                    window.update_specified_table('points_info_table', tlv_info)
+                    self.pending_tables['points_info_table'] = tlv_info
+            self.is_new_frame = True
         except Exception as e:
             logging.error(f"Error handling data: {e}")
 
     def update_plots_wrapper(self, window):
         """Wrapper function to update plots with new data."""
+        for table_id in list(self.pending_tables):
+            window.update_specified_table(table_id, self.pending_tables.pop(table_id))
+
+        # The timer ticks every 25 ms; only redraw when a new frame has arrived
+        if not self.is_new_frame:
+            return
+        self.is_new_frame = False
+
         radar_params = getattr(window, "radar_params", None)
         # unambiguous_range_m = radar_params.get("Unambiguous Range [m]", 10)
         maximum_range = radar_params.get("Maximum Range [m]", 10)
@@ -314,14 +330,20 @@ class RadarApplication:
             y_grid = np.linspace(np.min(yy), np.max(yy), azimuth_static_heatmap_grid_size)
 
             # Flatten the original data for interpolation
-            points = np.array([xx.flatten(), yy.flatten()]).T
             values = heatmap_data.flatten()
 
             # Create a 2D grid for the interpolation
             x_grid_2d, y_grid_2d = np.meshgrid(x_grid, y_grid)
 
-            # Interpolate the matrix onto the new grid
-            matrix_rescaled = griddata(points, values, (x_grid_2d, y_grid_2d), method='cubic')
+            # The polar grid only changes with the config, so triangulate once and reuse it
+            triangulation_key = (maximum_range, num_range_bins, num_azimuth_bins)
+            if triangulation_key != self.azimuth_triangulation_key:
+                points = np.array([xx.flatten(), yy.flatten()]).T
+                self.azimuth_triangulation = Delaunay(points)
+                self.azimuth_triangulation_key = triangulation_key
+
+            # Same cubic interpolation griddata(method='cubic') does
+            matrix_rescaled = CloughTocher2DInterpolator(self.azimuth_triangulation, values)((x_grid_2d, y_grid_2d))
 
             primary_axis = np.linspace(-maximum_range/2, maximum_range/2, num_range_bins)
             secondary_axis = np.linspace(0, maximum_range, num_range_bins)
